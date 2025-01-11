@@ -5,7 +5,7 @@ import numpy as np
 from datetime import datetime
 import time
 
-NUM_TOP_COINS = 3
+NUM_TOP_COINS = 10
 
 # Initialize CoinGecko API globally
 cg = CoinGeckoAPI()
