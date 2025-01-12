@@ -5,14 +5,13 @@ import numpy as np
 from datetime import datetime
 import time
 
-NUM_TOP_COINS = 10
+NUM_TOP_COINS = 4
 
 # Initialize CoinGecko API globally
 cg = CoinGeckoAPI()
 
-@st.cache_data(ttl=10800)  # Cache for 3 hours
+@st.cache_data(ttl=10800)
 def get_top_coins(limit=NUM_TOP_COINS):
-    """Get top coins by market cap"""
     try:
         coins = cg.get_coins_markets(
             vs_currency='usd',
@@ -25,9 +24,8 @@ def get_top_coins(limit=NUM_TOP_COINS):
         st.error(f"Error fetching top coins: {e}")
         return []
 
-@st.cache_data(ttl=10800)  # Cache for 3 hours
+@st.cache_data(ttl=10800)
 def get_historical_data(coin_id, days=30):
-    """Get historical OHLC data"""
     try:
         ohlc = cg.get_coin_ohlc_by_id(
             id=coin_id,
@@ -44,16 +42,34 @@ def get_historical_data(coin_id, days=30):
         st.error(f"Error fetching data for {coin_id}: {e}")
         return None
 
-def calculate_standard_volatility(data, window=30):
-    """Calculate standard volatility using close prices"""
-    if data is None or len(data) < window:
-        return None
+def calculate_support_resistance_distances(data, months=3):
+    """Calculate distances from current price to support and resistance levels using 3 month data"""
+    if data is None:
+        return None, None
 
-    returns = np.log(data['close'] / data['close'].shift(1))
-    rolling_std = returns.rolling(window=window).std()
-    annualized_vol = rolling_std.iloc[-1] * np.sqrt(252) if not rolling_std.empty else None
+    lookback_days = months * 30  # approximate days in N months
 
-    return annualized_vol * 100 if annualized_vol else None
+    # Take only last 3 months of data
+    recent_data = data[-lookback_days:]
+
+    if len(recent_data) < lookback_days / 2:
+        return None, None
+
+    # Calculate support as average of local minimums over 3 months
+    lows = recent_data['low'].rolling(window=5).min()  # Find local minimums
+    support_level = lows.mean()  # Average of all local minimums
+
+    # Calculate resistance as average of local maximums over 3 months
+    highs = recent_data['high'].rolling(window=5).max()  # Find local maximums
+    resistance_level = highs.mean()  # Average of all local maximums
+
+    current_price = data['close'].iloc[-1]
+
+    # Calculate distances in percentages
+    support_distance = ((current_price - support_level) / support_level * 100)
+    resistance_distance = ((resistance_level - current_price) / current_price * 100)
+
+    return support_distance, resistance_distance
 
 def calculate_parkinson_volatility(data, window=30):
     """Calculate Parkinson volatility with median window"""
@@ -64,23 +80,17 @@ def calculate_parkinson_volatility(data, window=30):
     daily_vol = np.sqrt(1 / (4 * np.log(2)) * log_hl)
 
     rolling_vol = daily_vol.rolling(window=window).median()
-    annualized_vol = rolling_vol.iloc[-1] * np.sqrt(252) if not rolling_vol.empty else None
+    volatility = rolling_vol.iloc[-1] * np.sqrt(252)
 
-    return annualized_vol * 100 if annualized_vol else None
+    return volatility * 100
 
 @st.cache_data(ttl=10800)
 def get_coin_id_mapping():
-    """Get mapping of coin symbols to their IDs"""
     try:
-        # Get list of all coins
         coins_list = cg.get_coins_list()
-
-        # Create mapping dictionary (symbol -> id)
-        # Using lower case for case-insensitive matching
         mapping = {}
         for coin in coins_list:
             symbol = coin['symbol'].lower()
-            # If we have multiple coins with same symbol, prefer the one with highest market cap
             if symbol not in mapping:
                 mapping[symbol] = coin['id']
         return mapping
@@ -89,21 +99,15 @@ def get_coin_id_mapping():
         return {}
 
 def get_coin_id(symbol, mapping):
-    """Get coin ID from symbol"""
     symbol = symbol.lower()
     return mapping.get(symbol)
 
 @st.cache_data(ttl=10800)
 def analyze_coins(coin_list=None):
-    """Analyze specified coins or top coins if no list provided"""
     results = []
 
-    # Get coins to analyze
     if coin_list:
-        # Get mapping of symbols to IDs
         mapping = get_coin_id_mapping()
-
-        # Convert symbols to IDs
         coins = []
         for symbol in coin_list:
             coin_id = get_coin_id(symbol, mapping)
@@ -129,26 +133,30 @@ def analyze_coins(coin_list=None):
 
         data = get_historical_data(coin['id'])
         if data is not None:
-            current_price = data['close'].iloc[-1]
-            std_volatility = calculate_standard_volatility(data)
-            park_volatility = calculate_parkinson_volatility(data)
+            volatility = calculate_parkinson_volatility(data)
+            support_dist, resistance_dist = calculate_support_resistance_distances(data)
 
             results.append({
                 'symbol': coin['symbol'],
-                'price': round(current_price, 4),
-                'std_volatility': round(std_volatility, 2) if std_volatility else None,
-                'park_volatility': round(park_volatility, 2) if park_volatility else None,
+                'volatility': round(volatility, 2) if volatility else None,
+                'support_dist': round(support_dist, 2) if support_dist else None,
+                'resistance_dist': round(resistance_dist, 2) if resistance_dist else None
             })
 
         time.sleep(1.5)  # Respect API rate limits
 
     progress_bar.empty()
     status_text.empty()
+
+    if not results:
+        return pd.DataFrame(columns=['symbol', 'volatility', 'support_dist', 'resistance_dist'])
+
     return pd.DataFrame(results)
 
-def apply_filters(df, min_vol, max_vol, search, volatility_type='park_volatility'):
-    """Apply filters to the dataframe without recomputing data"""
-    mask = (df[volatility_type] >= min_vol) & (df[volatility_type] <= max_vol)
+def apply_filters(df, min_vol, search):
+    if df.empty:
+        return df
+    mask = df['volatility'] >= min_vol
     if search:
         mask &= df['symbol'].str.contains(search.upper())
     return df[mask]
@@ -157,32 +165,20 @@ def main():
     st.set_page_config(page_title="Crypto Volatility Analysis", layout="wide")
 
     st.title("Crypto Volatility Analysis")
-    st.markdown("""
-    This dashboard shows volatility analysis for cryptocurrencies using both Standard and Parkinson methods.
-    Data is cached for 3 hours to respect API limits.
-    """)
 
-    # Initialize session state for data
     if 'data' not in st.session_state:
         st.session_state.data = None
 
-
-    # File upload and refresh section
-    #col1, col2 = st.columns([3, 1])
-    #with col1:
     uploaded_file = st.file_uploader(
         f"Upload a text file with coin symbols (one per line) or leave empty for top {NUM_TOP_COINS} coins",
         type=['txt']
     )
-    #with col2:
-        #st.write("")  # Add empty space to align with file uploader
     refresh = st.button("Refresh Data", type="primary")
 
     if refresh or (uploaded_file and st.session_state.data is None):
         st.cache_data.clear()
         st.session_state.data = None
 
-    # Fetch or get cached data
     if st.session_state.data is None:
         coin_list = None
         if uploaded_file:
@@ -191,74 +187,70 @@ def main():
 
         with st.spinner('Fetching and analyzing data...'):
             st.session_state.data = analyze_coins(coin_list)
-
-    if not len(st.session_state.data):
-        return
+            st.write("Data fetched:", len(st.session_state.data))
 
     # Filter controls
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2 = st.columns(2)
     with col1:
-        vol_type = st.selectbox(
-            "Filter by Volatility Type",
-            ['park_volatility', 'std_volatility'],
-            format_func=lambda x: 'Parkinson' if x == 'park_volatility' else 'Standard Deviation'
-        )
-    with col2:
         min_vol = st.number_input("Minimum Volatility %", value=0.0)
-    with col3:
-        max_vol = st.number_input("Maximum Volatility %", value=1000.0)
-    with col4:
+    with col2:
         search = st.text_input("Search by Symbol")
 
     # Apply filters to cached data
-    filtered_df = apply_filters(st.session_state.data, min_vol, max_vol, search, vol_type)
+    filtered_df = apply_filters(st.session_state.data, min_vol, search)
+    st.write("Filtered data:", len(filtered_df))
 
-    # Rename columns
-    display_df = filtered_df.copy()
-    display_df.columns = [
-        'Symbol',
-        'Price USD',
-        'Standard Volatility %',
-        'Parkinson Volatility %'
-    ]
+    if not filtered_df.empty:
+        # Rename columns for display
+        display_df = filtered_df.copy()
+        display_df.columns = [
+            'Symbol',
+            'Volatility %',
+            'Support Distance %',
+            'Resistance Distance %'
+        ]
 
-    # Display results with both volatility columns colored
-    st.dataframe(
-        display_df.style
-        .background_gradient(
-            subset=['Standard Volatility %', 'Parkinson Volatility %'],
-            cmap='RdYlGn_r'
-        )
-        .format({
-            'Price USD': '${:,.2f}',
-            'Standard Volatility %': '{:,.2f}%',
-            'Parkinson Volatility %': '{:,.2f}%'
-        }),
-        hide_index=True,
-        use_container_width=True
-    )
-
-    # Add statistics
-    st.subheader("Statistics")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric(
-            "Average Volatility",
-            f"{filtered_df[vol_type].mean():.2f}%"
-        )
-    with col2:
-        st.metric(
-            "Median Volatility",
-            f"{filtered_df[vol_type].median():.2f}%"
-        )
-    with col3:
-        st.metric(
-            "Coins Analyzed",
-            len(filtered_df)
+        # Display results
+        st.dataframe(
+            display_df.style
+            .background_gradient(
+                subset=['Volatility %'],
+                cmap='Greens',  # Only green shades
+                vmin=filtered_df['volatility'].min(),
+                vmax=filtered_df['volatility'].max()
+            )
+            .format({
+                'Volatility %': '{:,.2f}%',
+                'Support Distance %': '{:,.2f}%',
+                'Resistance Distance %': '{:,.2f}%'
+            }),
+            hide_index=True,
+            use_container_width=True
         )
 
-    # Add timestamp
-    st.markdown(f"*Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+        # Add statistics
+        st.subheader("Statistics")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric(
+                "Average Volatility",
+                f"{filtered_df['volatility'].mean():.2f}%"
+            )
+        with col2:
+            st.metric(
+                "Median Volatility",
+                f"{filtered_df['volatility'].median():.2f}%"
+            )
+        with col3:
+            st.metric(
+                "Coins Analyzed",
+                len(filtered_df)
+            )
+
+        # Add timestamp
+        st.markdown(f"*Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+    else:
+        st.warning("No data to display. Try adjusting filters or uploading different symbols.")
 
 if __name__ == "__main__":
     main()
